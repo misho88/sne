@@ -4,7 +4,7 @@ from argparse import ArgumentParser
 from sys import stdin, stderr
 from socketserver import ThreadingTCPServer, BaseRequestHandler
 from socket import SOL_SOCKET, SO_REUSEADDR
-from threading import Thread
+from threading import Thread, Lock
 from queue import SimpleQueue
 from time import sleep
 
@@ -22,13 +22,13 @@ parser.add_argument(
     help='how much data to process at a time'
 )
 parser.add_argument(
-    '--subs', '-s', type=int, default=0,
+    '--subscribers', '--subs' '-s', type=int, default=0,
     help='wait for at least this many subscribers before publishing '
          '(useful for broadcasting a file or something)'
 )
 parser.add_argument(
     '--verbose', '-v', action='store_true',
-    help='debugging information (on stderr)'
+    help='print debugging information (on stderr)'
 )
 args = parser.parse_args()
 
@@ -41,10 +41,18 @@ queues = {}
 
 if args.verbose:
     def debug(*args, **kwargs):
-        print(*args, file=stderr, **kwargs)
+        with debug.lock:
+            print(*args, file=stderr, flush=True, **kwargs)
+    debug.lock = Lock()  # noqa: E305
 else:
     def debug(*args, **kwargs):
         pass
+
+
+def update(*args, **kwargs):
+    with update.lock:
+        print(*args, flush=True, **kwargs)  # flush is only forced on NL if stdout is a TTY
+update.lock = Lock()  # noqa: E305
 
 
 def await_goodbye(request, queue):
@@ -53,12 +61,12 @@ def await_goodbye(request, queue):
 
 
 def handle(request):
-    name = request.getpeername()
-    debug(name, 'connected', file=stderr)
+    name = host, port = request.getpeername()
+    debug(f'connected: {host}:{port}')
     qi, qo = SimpleQueue(), SimpleQueue()
     queues[name] = qi, qo
     Thread(target=await_goodbye, args=(request, qi)).start()
-    print(len(queues))
+    update(len(queues))
     try:
         while qi.get():
             request.send(buf[:size])
@@ -67,8 +75,8 @@ def handle(request):
         pass
     finally:
         del queues[name]
-        debug(name, 'disconnected', file=stderr)
-        print(len(queues))
+        debug(f'disconnected: {host}:{port}')
+        update(len(queues))
 
 
 class Handler(BaseRequestHandler):
@@ -76,16 +84,16 @@ class Handler(BaseRequestHandler):
         handle(self.request)
 
 
-server = ThreadingTCPServer((args.host, args.port), Handler, bind_and_activate=False)
-server.socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-
 try:
+    server = ThreadingTCPServer((args.host, args.port), Handler, bind_and_activate=False)
+    server.socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
     server.server_bind()
     server.server_activate()
     server_thread = Thread(target=server.serve_forever)
     server_thread.start()
+    update(len(queues))
     while size:
-        while len(queues) < args.subs:
+        while len(queues) < args.subscribers:
             sleep(0.05)
         size = stdin.buffer.readinto1(buf)
         for qo, qi in queues.values():
