@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+
+from argparse import ArgumentParser
+from sys import stdin, stderr
+from socketserver import ThreadingTCPServer, BaseRequestHandler
+from socket import SOL_SOCKET, SO_REUSEADDR
+from threading import Thread
+from queue import SimpleQueue
+from time import sleep
+
+parser = ArgumentParser()
+parser.add_argument(
+    '--host', '-l', default='0.0.0.0',
+    help='address to listen on'
+)
+parser.add_argument(
+    '--port', '-p', type=int, required=True,
+    help='port to listen on'
+)
+parser.add_argument(
+    '--buffer-size', '-b', type=int, default=4096,
+    help='how much data to process at a time'
+)
+parser.add_argument(
+    '--subs', '-s', type=int, default=0,
+    help='wait for at least this many subscribers before publishing '
+         '(useful for broadcasting a file or something)'
+)
+parser.add_argument(
+    '--verbose', '-v', action='store_true',
+    help='debugging information (on stderr)'
+)
+args = parser.parse_args()
+
+
+buf = bytearray(args.buffer_size)
+size = -1
+
+queues = {}
+
+
+if args.verbose:
+    def debug(*args, **kwargs):
+        print(*args, file=stderr, **kwargs)
+else:
+    def debug(*args, **kwargs):
+        pass
+
+
+def await_goodbye(request, queue):
+    request.recv(1)
+    queue.put(0)
+
+
+def handle(request):
+    name = request.getpeername()
+    debug(name, 'connected', file=stderr)
+    qi, qo = SimpleQueue(), SimpleQueue()
+    queues[name] = qi, qo
+    Thread(target=await_goodbye, args=(request, qi)).start()
+    print(len(queues))
+    try:
+        while qi.get():
+            request.send(buf[:size])
+            qo.put(1)
+    except BrokenPipeError:
+        pass
+    finally:
+        del queues[name]
+        debug(name, 'disconnected', file=stderr)
+        print(len(queues))
+
+
+class Handler(BaseRequestHandler):
+    def handle(self):
+        handle(self.request)
+
+
+server = ThreadingTCPServer((args.host, args.port), Handler, bind_and_activate=False)
+server.socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+
+try:
+    server.server_bind()
+    server.server_activate()
+    server_thread = Thread(target=server.serve_forever)
+    server_thread.start()
+    while size:
+        while len(queues) < args.subs:
+            sleep(0.05)
+        size = stdin.buffer.readinto1(buf)
+        for qo, qi in queues.values():
+            qo.put(1)
+        for qo, qi in queues.values():
+            qi.get()
+    for qo, qi in queues.values():
+        qo.put(0)
+except KeyboardInterrupt:
+    pass
+finally:
+    server.shutdown()
+    server_thread.join()
+    server.server_close()

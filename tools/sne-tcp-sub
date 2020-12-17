@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+
+from sys import stdout, stderr
+from argparse import ArgumentParser
+from socket import socket
+
+parser = ArgumentParser()
+parser.add_argument(
+    '--host', '-r', required=True,
+    help='address to listen on'
+)
+parser.add_argument(
+    '--port', '-p', type=int, required=True,
+    help='port to listen on'
+)
+parser.add_argument(
+    '--buffer-size', '-b', type=int, default=4096,
+    help='how much data to process at a time'
+)
+args = parser.parse_args()
+
+try:
+    with socket() as sock:
+        sock.connect((args.host, args.port))
+        while (piece := sock.recv(args.buffer_size)):
+            stdout.buffer.write(piece)
+            stdout.buffer.flush()
+except KeyboardInterrupt:
+    pass
