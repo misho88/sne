@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+
+from argparse import ArgumentParser
+from selectors import DefaultSelector, EVENT_READ
+
+parser = ArgumentParser()
+parser.add_argument(
+    '--buffer-size', '-n', type=int, default=4096,
+    help='how much data to process at a time'
+)
+parser.add_argument(
+    '--verbose', '-v', action='store_true',
+    help='print debugging information (on stderr)'
+)
+args = parser.parse_args()
+
+
+class Finished(Exception):
+    pass
+
+
+stdin = open(0, 'rb')
+remin = open(3, 'rb')
+remout = open(4, 'wb')
+
+with stdin, remin, remout:
+    selector = DefaultSelector()
+    selector.register(remin, EVENT_READ)
+    selector.register(stdin, EVENT_READ)
+
+    try:
+        while True:
+            events = selector.select()
+            for key, mask in events:
+                if key.fileobj == remin:   # mostly ignore remote's input
+                    if not remin.read1():  # but if it has disconnected
+                        raise Finished     # we're finished
+                elif key.fileobj == stdin:
+                    piece = stdin.read1(args.buffer_size)
+                    if piece:
+                        remout.write(piece)
+                        remout.flush()
+                    else:
+                        raise Finished
+                else:
+                    raise RuntimeError(f'key looks wonky: {key}')
+    except (KeyboardInterrupt, Finished):
+        pass
