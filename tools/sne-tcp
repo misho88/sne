@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+
+from argparse import ArgumentParser, ArgumentTypeError
+import sys
+from pysh import to, Process, Pipe
+from socket import (
+    create_server, create_connection, has_dualstack_ipv6,
+    AF_INET, AF_INET6,
+    SHUT_RDWR, SHUT_RD, SHUT_WR,
+)
+from selectors import DefaultSelector, EVENT_READ
+
+
+def address(spec):
+    error = ArgumentTypeError(f'must be ":port" or "host:port", not "{spec}"')
+    if ':' not in spec:
+        raise error
+    host, port = spec.rsplit(':', maxsplit=1)
+    try:
+        return host, int(port)
+    except ValueError:
+        raise error
+
+
+parser = ArgumentParser()
+
+mode = parser.add_mutually_exclusive_group(required=True)
+mode.add_argument(
+    '--bind', '-b', action='store_true',
+    help='bind to an address and listen for connections',
+)
+mode.add_argument(
+    '--connect', '-c', action='store_true',
+    help='connect to something that listening for connections',
+)
+parser.add_argument(
+    'address', type=address,
+    help='address to listen on',
+)
+parser.add_argument(
+    '--action', '-a',
+    help='what to do with the connection (an argv)',
+)
+parser.add_argument(
+    '--io-mapping', '-m', nargs=5,
+    choices=('stdin', 'stdout', 'stderr', 'remin', 'remout', 'none'),
+    default=['stdin', 'stdout', 'stderr', 'remin', 'remout'],
+    help='how to assign the various streams to the action; stdin is copied '
+         'to each handler; stdout and stderr are collected from each and '
+         'forwarded with a degree of atomicity; remin and remout are sent '
+         'down the socket; none disables the stream ',
+)
+parser.add_argument(
+    '--buffer-size', '-s', type=int, default=4096,
+    help='how much data to process at a time',
+)
+parser.add_argument(
+    '--verbose', '-v', action='store_true',
+    help='print debugging information (on stderr)',
+)
+parser.add_argument(
+    '--min-remotes', '-n', type=int, default=0,
+    help='do nothing until this many remote connections are achieved'
+)
+args = parser.parse_args()
+
+if args.connect and args.min_remotes > 1:
+    print(
+        'WARNING: --connect implies there at most 1 remote, '
+        'but --min-remotes is {args.min_remotes}',
+        file=sys.stderr,
+    )
+
+selector = DefaultSelector()
+handler_stdins = set()
+
+
+def getfds():
+    from pathlib import Path
+    for path in Path('/proc/self/fd').iterdir():
+        yield path.name, path.resolve()
+
+
+if args.verbose:
+    def debug(msg):
+        from inspect import currentframe
+        frame = currentframe().f_back
+        print(f'{frame.f_code.co_name}() L{frame.f_lineno}: {msg}', file=sys.stderr)
+else:
+    def debug(msg):
+        pass
+
+
+def on_stdin(stdin):
+    from time import sleep
+    debug("enter")
+    if len(handler_stdins) < args.min_remotes:
+        sleep(0.05)
+        return
+    piece = stdin.read1(args.buffer_size)
+    if piece:
+        for hin in handler_stdins:
+            hin.write(piece)
+            hin.flush()
+    else:
+        selector.unregister(stdin)
+        stdin.close()
+        for hin in handler_stdins:
+            hin.close()
+    debug("exit")
+
+
+def on_server(server):
+    debug("enter")
+    debug(dict(getfds()))
+    remote, address = server.accept()
+    print(f'new conn from {address}')
+    create_handler_process(remote)
+    debug("exit")
+
+
+def create_handler_process(remote):
+    debug("enter")
+    pipes = {
+        name: Pipe()
+        for name in args.io_mapping
+        if name != 'none'
+    }
+
+    streams = {}
+    for i, name in enumerate(args.io_mapping):
+        if name in pipes:
+            if name in ('stdin', 'remin'):
+                streams[i] = pipes[name].read_fd
+            else:
+                streams[i] = pipes[name].write_fd
+        else:
+            streams[i] = None
+
+    proc = Process(args.action, other_streams=streams)
+
+    inputs = {}
+    if 'stdin' in pipes:
+        pipes['stdin'].read_fd.close()
+        inputs['stdin'] = pipes['stdin'].write_fd.open()
+        handler_stdins.add(inputs['stdin'])
+    if 'remin' in pipes:
+        pipes['remin'].read_fd.close()
+        inputs['remin'] = pipes['remin'].write_fd.open()
+        selector.register(remote, EVENT_READ, on_remote[inputs['remin']])
+
+    outputs = {}
+    for name in 'stdout', 'stderr', 'remout':
+        if name in pipes:
+            pipes[name].write_fd.close()
+            outputs[name] = pipes[name].read_fd.open()
+
+    for name, output in outputs.items():
+        selector.register(output, EVENT_READ, on_handler_output[proc, inputs, outputs, remote])
+
+    debug(dict(getfds()))
+    debug("exit")
+
+
+@to
+def on_remote(remin, remote):
+    debug("enter")
+    piece = remote.recv(args.buffer_size)
+    debug(piece)
+    if piece:
+        remin.write(piece)
+        remin.flush()
+    else:
+        selector.unregister(remote)
+        remote.shutdown(SHUT_RD)
+        remin.close()
+    debug("exit")
+
+
+@to
+def on_handler_output(proc, inputs, outputs, remote, output):
+    debug(f"enter {output}")
+    piece = output.read1()
+    if piece:
+        if outputs.get('stdout') is output:
+            debug(f'{piece} to stdout')
+            sys.stdout.buffer.write(piece)
+            sys.stdout.buffer.flush()
+        elif outputs.get('stderr') is output:
+            debug(f'{piece} to stderr')
+            sys.stderr.buffer.write(piece)
+            sys.stderr.buffer.flush()
+        elif outputs.get('remout') is output:
+            debug(f'{piece} to remote')
+            remote.send(piece)
+        else:
+            raise RuntimeError(f'output {output} not in {outputs}')
+    else:
+        output.close()
+        selector.unregister(output)
+        if outputs.get('remout') is output:
+            remote.shutdown(SHUT_WR)
+        if all(o.closed for o in outputs.values()):
+            proc.waitpid()
+            for input in inputs.values():
+                input.close()
+            remote.close()
+            selector.unregister(remote)
+            try:
+                handler_stdins.remove(inputs['stdin'])
+            except KeyError:
+                pass
+    debug("exit")
+
+
+selector.register(sys.stdin.buffer, EVENT_READ, on_stdin)
+if args.bind:
+    dualstack_ipv6 = has_dualstack_ipv6()
+    family = AF_INET6 if dualstack_ipv6 else AF_INET
+    server = create_server(args.address, family=family, dualstack_ipv6=dualstack_ipv6)
+    selector.register(server, EVENT_READ, on_server)
+elif args.connect:
+    remote = create_connection(args.address)
+    create_handler_process(remote)
+
+
+try:
+    while True:
+        events = selector.select()
+        for key, mask in events:
+            handle, fileobj = key.data, key.fileobj
+            handle(fileobj)
+except KeyboardInterrupt:
+    pass
