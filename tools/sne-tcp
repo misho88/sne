@@ -4,11 +4,13 @@ from argparse import ArgumentParser, ArgumentTypeError
 import sys
 from pysh import to, Process, Pipe
 from socket import (
-    create_server, create_connection, has_dualstack_ipv6,
+    socket, has_dualstack_ipv6,
+    create_server, create_connection,
     AF_INET, AF_INET6,
     SHUT_RDWR, SHUT_RD, SHUT_WR,
 )
 from selectors import DefaultSelector, EVENT_READ
+from time import sleep
 
 
 def address(spec):
@@ -60,7 +62,16 @@ parser.add_argument(
 )
 parser.add_argument(
     '--min-remotes', '-n', type=int, default=0,
-    help='do nothing until this many remote connections are achieved'
+    help='do nothing unless this many remote connections exist; 0 and 1 are '
+         'common values'
+)
+parser.add_argument(
+    '--exit-after-last-remote', '-l', action='store_true',
+    help='when the last remote disconnects, quit'
+)
+parser.add_argument(
+    '--feedback-mode', '-f', default='none', choices=('none', 'numeric', 'list', 'json'),
+    help='how to provide feedback on remote connections'
 )
 args = parser.parse_args()
 
@@ -73,6 +84,10 @@ if args.connect and args.min_remotes > 1:
 
 selector = DefaultSelector()
 handler_stdins = set()
+
+
+class Finished(Exception):
+    pass
 
 
 def getfds():
@@ -91,8 +106,46 @@ else:
         pass
 
 
+def get_remotes():
+    return (
+        key.fileobj
+        for key in selector.get_map().values()
+        if isinstance(key.fileobj, socket)
+        if key.fileobj is not server
+    )
+
+
+if args.feedback_mode == 'none':
+    def feedback():
+        pass
+elif args.feedback_mode == 'numeric':
+    def feedback():
+        n = sum(1 for _ in get_remotes())
+        print(n, file=sys.stderr, flush=True)
+elif args.feedback_mode == 'list':
+    def format(socket):
+        host, port = socket.getpeername()[:2]
+        return f'{host}:{port}'
+
+    def feedback():
+        infos = (format(r) for r in get_remotes())
+        print(*infos, file=sys.stderr, flush=True)
+elif args.feedback_mode == 'json':
+    import json
+
+    def feedback():
+        names = 'host', 'port'
+        infos = [
+            dict(zip(names, r.getpeername()))
+            for r in get_remotes()
+        ]
+        json.dump(infos, sys.stderr)
+        print(file=sys.stderr, flush=True)
+else:
+    RuntimeError('error in the --feedback-mode argument definition')
+
+
 def on_stdin(stdin):
-    from time import sleep
     debug("enter")
     if len(handler_stdins) < args.min_remotes:
         sleep(0.05)
@@ -114,7 +167,6 @@ def on_server(server):
     debug("enter")
     debug(dict(getfds()))
     remote, address = server.accept()
-    print(f'new conn from {address}')
     create_handler_process(remote)
     debug("exit")
 
@@ -158,8 +210,24 @@ def create_handler_process(remote):
     for name, output in outputs.items():
         selector.register(output, EVENT_READ, on_handler_output[proc, inputs, outputs, remote])
 
-    debug(dict(getfds()))
+    feedback()
     debug("exit")
+
+
+def destroy_handler_process(proc, inputs, remote):
+    proc.waitpid()
+    for input in inputs.values():
+        input.close()
+    remote.close()
+    try:
+        selector.unregister(remote)
+    except ValueError:
+        pass
+    try:
+        handler_stdins.remove(inputs['stdin'])
+    except KeyError:
+        pass
+    feedback()
 
 
 @to
@@ -201,16 +269,19 @@ def on_handler_output(proc, inputs, outputs, remote, output):
         if outputs.get('remout') is output:
             remote.shutdown(SHUT_WR)
         if all(o.closed for o in outputs.values()):
-            proc.waitpid()
-            for input in inputs.values():
-                input.close()
-            remote.close()
-            selector.unregister(remote)
-            try:
-                handler_stdins.remove(inputs['stdin'])
-            except KeyError:
-                pass
+            destroy_handler_process(proc, inputs, remote)
     debug("exit")
+
+
+def connect():
+    while True:
+        try:
+            remote = create_connection(args.address)
+        except ConnectionRefusedError:
+            sleep(0.5)
+        else:
+            create_handler_process(remote)
+            break
 
 
 selector.register(sys.stdin.buffer, EVENT_READ, on_stdin)
@@ -219,16 +290,24 @@ if args.bind:
     family = AF_INET6 if dualstack_ipv6 else AF_INET
     server = create_server(args.address, family=family, dualstack_ipv6=dualstack_ipv6)
     selector.register(server, EVENT_READ, on_server)
-elif args.connect:
-    remote = create_connection(args.address)
-    create_handler_process(remote)
-
+else:
+    server = None
 
 try:
+    feedback()
     while True:
+        if args.connect and len(selector.get_map()) <= 1:
+            connect()
         events = selector.select()
         for key, mask in events:
             handle, fileobj = key.data, key.fileobj
             handle(fileobj)
-except KeyboardInterrupt:
-    pass
+        if args.exit_after_last_remote and sum(1 for _ in get_remotes()) == 0:
+            raise Finished
+except (KeyboardInterrupt, Finished):
+    for fd, key in selector.get_map().items():
+        fileobj = key.fileobj
+        if isinstance(fileobj, socket):
+            fileobj.shutdown(SHUT_RDWR)
+        fileobj.close()
+    feedback()
