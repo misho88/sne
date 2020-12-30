@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+
+from argparse import ArgumentParser
+from selectors import DefaultSelector, EVENT_READ
+
+parser = ArgumentParser()
+parser.add_argument(
+    '--buffer-size', '-s', type=int, default=4096,
+    help='how much data to process at a time'
+)
+parser.add_argument(
+    '--verbose', '-v', action='store_true',
+    help='print debugging information (on stderr)'
+)
+args = parser.parse_args()
+
+
+class Finished(Exception):
+    pass
+
+
+stdout = open(1, 'wb')
+remin = open(3, 'rb')
+
+with remin, stdout:
+    try:
+        while (piece := remin.read1(args.buffer_size)):
+            stdout.write(piece)
+            stdout.flush()
+    except (KeyboardInterrupt, Finished):
+        pass
