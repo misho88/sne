@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+
+from argparse import ArgumentParser, ArgumentTypeError
+import sys
+from pysh import to, Process, Pipe
+from socket import (
+    socket, has_dualstack_ipv6,
+    create_server, create_connection,
+    AF_INET, AF_INET6,
+    SHUT_RDWR, SHUT_RD, SHUT_WR,
+)
+from selectors import DefaultSelector, EVENT_READ
+from time import sleep
+
+
+def address(spec):
+    error = ArgumentTypeError(f'must be ":port" or "host:port", not "{spec}"')
+    if ':' not in spec:
+        raise error
+    host, port = spec.rsplit(':', maxsplit=1)
+    try:
+        return host, int(port)
+    except ValueError:
+        raise error
+
+
+parser = ArgumentParser()
+
+mode = parser.add_mutually_exclusive_group(required=True)
+mode.add_argument(
+    '--bind', '-b', action='store_true',
+    help='bind to an address and listen for connections',
+)
+mode.add_argument(
+    '--connect', '-c', action='store_true',
+    help='connect to something that listening for connections',
+)
+parser.add_argument(
+    'address', type=address,
+    help='address to listen on',
+)
+parser.add_argument(
+    '--action', '-a',
+    help='what to do with the connection (an argv)',
+)
+parser.add_argument(
+    '--io-mapping', '-m', nargs=5,
+    choices=('stdin', 'stdout', 'stderr', 'remin', 'remout', 'none'),
+    default=['stdin', 'stdout', 'stderr', 'remin', 'remout'],
+    help='how to assign the various streams to the action; stdin is copied '
+         'to each handler; stdout and stderr are collected from each and '
+         'forwarded with a degree of atomicity; remin and remout are sent '
+         'down the socket; none disables the stream ',
+)
+parser.add_argument(
+    '--buffer-size', '-s', type=int, default=4096,
+    help='how much data to process at a time',
+)
+parser.add_argument(
+    '--verbose', '-v', action='store_true',
+    help='print debugging information (on stderr)',
+)
+parser.add_argument(
+    '--min-remotes', '-n', type=int, default=0,
+    help='do nothing unless this many remote connections exist; 0 and 1 are '
+         'common values'
+)
+parser.add_argument(
+    '--exit-after-last-remote', '-l', action='store_true',
+    help='when the last remote disconnects, quit'
+)
+parser.add_argument(
+    '--feedback-mode', '-f', default='none', choices=('none', 'numeric', 'list', 'json'),
+    help='how to provide feedback on remote connections'
+)
+args = parser.parse_args()
+
+if args.connect and args.min_remotes > 1:
+    print(
+        'WARNING: --connect implies there at most 1 remote, '
+        'but --min-remotes is {args.min_remotes}',
+        file=sys.stderr,
+    )
+
+selector = DefaultSelector()
+handler_stdins = set()
+
+
+class Finished(Exception):
+    pass
+
+
+def getfds():
+    from pathlib import Path
+    for path in Path('/proc/self/fd').iterdir():
+        yield path.name, path.resolve()
+
+
+if args.verbose:
+    def debug(msg):
+        from inspect import currentframe
+        frame = currentframe().f_back
+        print(f'{frame.f_code.co_name}() L{frame.f_lineno}: {msg}', file=sys.stderr)
+else:
+    def debug(msg):
+        pass
+
+
+def get_remotes():
+    return (
+        key.fileobj
+        for key in selector.get_map().values()
+        if isinstance(key.fileobj, socket)
+        if key.fileobj is not server
+    )
+
+
+if args.feedback_mode == 'none':
+    def feedback():
+        pass
+elif args.feedback_mode == 'numeric':
+    def feedback():
+        n = sum(1 for _ in get_remotes())
+        print(n, file=sys.stderr, flush=True)
+elif args.feedback_mode == 'list':
+    def format(socket):
+        host, port = socket.getpeername()[:2]
+        return f'{host}:{port}'
+
+    def feedback():
+        infos = (format(r) for r in get_remotes())
+        print(*infos, file=sys.stderr, flush=True)
+elif args.feedback_mode == 'json':
+    import json
+
+    def feedback():
+        names = 'host', 'port'
+        infos = [
+            dict(zip(names, r.getpeername()))
+            for r in get_remotes()
+        ]
+        json.dump(infos, sys.stderr)
+        print(file=sys.stderr, flush=True)
+else:
+    RuntimeError('error in the --feedback-mode argument definition')
+
+
+def on_stdin(stdin):
+    debug("enter")
+    if len(handler_stdins) < args.min_remotes:
+        sleep(0.05)
+        return
+    piece = stdin.read1(args.buffer_size)
+    if piece:
+        for hin in handler_stdins:
+            hin.write(piece)
+            hin.flush()
+    else:
+        selector.unregister(stdin)
+        stdin.close()
+        for hin in handler_stdins:
+            hin.close()
+    debug("exit")
+
+
+def on_server(server):
+    debug("enter")
+    debug(dict(getfds()))
+    remote, address = server.accept()
+    create_handler_process(remote)
+    debug("exit")
+
+
+def create_handler_process(remote):
+    debug("enter")
+    pipes = {
+        name: Pipe()
+        for name in args.io_mapping
+        if name != 'none'
+    }
+
+    streams = {}
+    for i, name in enumerate(args.io_mapping):
+        if name in pipes:
+            if name in ('stdin', 'remin'):
+                streams[i] = pipes[name].read_fd
+            else:
+                streams[i] = pipes[name].write_fd
+        else:
+            streams[i] = None
+
+    proc = Process(args.action, other_streams=streams)
+
+    inputs = {}
+    if 'stdin' in pipes:
+        pipes['stdin'].read_fd.close()
+        inputs['stdin'] = pipes['stdin'].write_fd.open()
+        handler_stdins.add(inputs['stdin'])
+    if 'remin' in pipes:
+        pipes['remin'].read_fd.close()
+        inputs['remin'] = pipes['remin'].write_fd.open()
+        selector.register(remote, EVENT_READ, on_remote[inputs['remin']])
+
+    outputs = {}
+    for name in 'stdout', 'stderr', 'remout':
+        if name in pipes:
+            pipes[name].write_fd.close()
+            outputs[name] = pipes[name].read_fd.open()
+
+    for name, output in outputs.items():
+        selector.register(output, EVENT_READ, on_handler_output[proc, inputs, outputs, remote])
+
+    feedback()
+    debug("exit")
+
+
+def destroy_handler_process(proc, inputs, remote):
+    proc.waitpid()
+    for input in inputs.values():
+        input.close()
+    remote.close()
+    try:
+        selector.unregister(remote)
+    except ValueError:
+        pass
+    try:
+        handler_stdins.remove(inputs['stdin'])
+    except KeyError:
+        pass
+    feedback()
+
+
+@to
+def on_remote(remin, remote):
+    debug("enter")
+    piece = remote.recv(args.buffer_size)
+    debug(piece)
+    if piece:
+        remin.write(piece)
+        remin.flush()
+    else:
+        selector.unregister(remote)
+        remote.shutdown(SHUT_RD)
+        remin.close()
+    debug("exit")
+
+
+@to
+def on_handler_output(proc, inputs, outputs, remote, output):
+    debug(f"enter {output}")
+    piece = output.read1()
+    if piece:
+        if outputs.get('stdout') is output:
+            debug(f'{piece} to stdout')
+            sys.stdout.buffer.write(piece)
+            sys.stdout.buffer.flush()
+        elif outputs.get('stderr') is output:
+            debug(f'{piece} to stderr')
+            sys.stderr.buffer.write(piece)
+            sys.stderr.buffer.flush()
+        elif outputs.get('remout') is output:
+            debug(f'{piece} to remote')
+            remote.send(piece)
+        else:
+            raise RuntimeError(f'output {output} not in {outputs}')
+    else:
+        output.close()
+        selector.unregister(output)
+        if outputs.get('remout') is output:
+            remote.shutdown(SHUT_WR)
+        if all(o.closed for o in outputs.values()):
+            destroy_handler_process(proc, inputs, remote)
+    debug("exit")
+
+
+def connect():
+    while True:
+        try:
+            remote = create_connection(args.address)
+        except ConnectionRefusedError:
+            sleep(0.5)
+        else:
+            create_handler_process(remote)
+            break
+
+
+selector.register(sys.stdin.buffer, EVENT_READ, on_stdin)
+if args.bind:
+    dualstack_ipv6 = has_dualstack_ipv6()
+    family = AF_INET6 if dualstack_ipv6 else AF_INET
+    server = create_server(args.address, family=family, dualstack_ipv6=dualstack_ipv6)
+    selector.register(server, EVENT_READ, on_server)
+else:
+    server = None
+
+try:
+    feedback()
+    while True:
+        if args.connect and len(selector.get_map()) <= 1:
+            connect()
+        events = selector.select()
+        for key, mask in events:
+            handle, fileobj = key.data, key.fileobj
+            handle(fileobj)
+        if args.exit_after_last_remote and sum(1 for _ in get_remotes()) == 0:
+            raise Finished
+except (KeyboardInterrupt, Finished):
+    for fd, key in selector.get_map().items():
+        fileobj = key.fileobj
+        if isinstance(fileobj, socket):
+            fileobj.shutdown(SHUT_RDWR)
+        fileobj.close()
+    feedback()
