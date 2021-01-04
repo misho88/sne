@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+
+from argparse import ArgumentParser, ArgumentTypeError
+from sys import stderr
+from socketserver import ThreadingTCPServer, BaseRequestHandler
+from socket import SOL_SOCKET, SO_REUSEADDR
+from threading import Lock
+
+from pysh import Process, InputPipe, OutputPipe
+
+
+def address(spec):
+    error = ArgumentTypeError(f'must be "port", ":port" or "host:port", not "{spec}"')
+    try:
+        return '0.0.0.0', int(spec)
+    except ValueError:
+        pass
+    if ':' not in spec:
+        raise error
+    host, port = spec.rsplit(':', maxsplit=1)
+    if host in ('', '*'):
+        host = '0.0.0.0'
+    try:
+        return host, int(port)
+    except ValueError:
+        raise error
+
+
+parser = ArgumentParser()
+parser.add_argument(
+    'address', type=address,
+    help='address to listen on'
+)
+parser.add_argument(
+    '--buffer-size', '-b', type=int, default=4096,
+    help='how much data to process at a time'
+)
+parser.add_argument(
+    '--handler', '-a', required=True,
+    help='program that deals with requests (e.g., cat for an echo server)'
+)
+parser.add_argument(
+    '--verbose', '-v', action='store_true',
+    help='print debugging information (on stderr)'
+)
+args = parser.parse_args()
+
+
+if args.verbose:
+    def debug(*args, **kwargs):
+        with debug.lock:
+            print(*args, file=stderr, flush=True, **kwargs)
+    debug.lock = Lock()  # noqa: E305
+else:
+    def debug(*args, **kwargs):
+        pass
+
+
+def update(*args, **kwargs):
+    with update.lock:
+        print(*args, flush=True, **kwargs)  # flush is only forced on NL if stdout is a TTY
+update.lock = Lock()  # noqa: E305
+
+
+def read(socket):
+    while (piece := socket.recv(args.buffer_size)):
+        yield piece
+
+
+def handle(socket):
+    inp = InputPipe(read(socket))
+    out = OutputPipe()
+    prc = Process(args.handler, inp, out)
+    out.close_local()
+    with out.read_fd.open() as stream:
+        while (piece := stream.read(args.buffer_size)):
+            socket.send(piece)
+    prc.wait()
+
+
+class Handler(BaseRequestHandler):
+    def handle(self):
+        host, port = self.request.getpeername()
+        debug(f'connected: {host}:{port}')
+        try:
+            handle(self.request)
+        finally:
+            debug(f'disconnected: {host}:{port}')
+
+
+try:
+    server = ThreadingTCPServer(args.address, Handler, bind_and_activate=False)
+    server.socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+    server.server_bind()
+    server.server_activate()
+    server.serve_forever()
+except KeyboardInterrupt:
+    pass
+finally:
+    server.server_close()
+    server.shutdown()

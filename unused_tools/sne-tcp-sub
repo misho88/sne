@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+
+from sys import stdout
+from argparse import ArgumentParser, ArgumentTypeError
+from socket import socket
+from time import sleep
+
+
+def address(spec):
+    error = ArgumentTypeError(f'must be "port", ":port" or "host:port", not "{spec}"')
+    try:
+        return 'localhost', int(spec)
+    except ValueError:
+        pass
+    if ':' not in spec:
+        raise error
+    host, port = spec.rsplit(':', maxsplit=1)
+    if host == '':
+        host = 'localhost'
+    try:
+        return host, int(port)
+    except ValueError:
+        raise error
+
+
+parser = ArgumentParser()
+parser.add_argument(
+    'address', type=address,
+    help='address to listen on'
+)
+parser.add_argument(
+    '--buffer-size', '-b', type=int, default=4096,
+    help='how much data to process at a time'
+)
+args = parser.parse_args()
+
+
+def read(sock):
+    while True:
+        try:
+            sock.connect(args.address)
+            break
+        except ConnectionRefusedError:
+            sleep(0.5)
+    while (piece := sock.recv(args.buffer_size)):
+        stdout.buffer.write(piece)
+        stdout.buffer.flush()
+
+
+try:
+    while True:
+        with socket() as sock:
+            read(sock)
+except KeyboardInterrupt:
+    pass
