@@ -16,25 +16,36 @@ from time import sleep
 from pathlib import Path
 
 
-def address(spec):
+def tcp_address(spec):
     error = ArgumentTypeError(f'must be ":port" or "host:port", not "{spec}"')
-    if spec.startswith('ipc:'):
-        spec = spec[4:]
-        if spec.startswith('//'):
-            spec = spec[2:]
-        return AF_UNIX, Path(spec)
-    else:
-        if spec.startswith('tcp:'):
-            spec = spec[4:]
-            if spec.startswith('//'):
-                spec = spec[2:]
-        if ':' not in spec:
-            raise error
-        host, port = spec.rsplit(':', maxsplit=1)
-        try:
-            return AF_INET, (host, int(port))
-        except ValueError:
-            raise error
+    if ':' not in spec:
+        raise error
+    host, port = spec.rsplit(':', maxsplit=1)
+    if host == '*':  # for 0MQ compatibility
+        host = ''
+    try:
+        return AF_INET, (host, int(port))
+    except ValueError:
+        raise error
+
+
+def ipc_address(spec):
+    return AF_UNIX, Path(spec)
+
+
+def address(spec):
+    if spec.lower().startswith('ipc://'):
+        return ipc_address(spec[6:])
+    if spec.lower().startswith('ipc:'):
+        return ipc_address(spec[4:])
+    if spec.lower().startswith('tcp://'):
+        return tcp_address(spec[6:])
+    if spec.lower().startswith('tcp:'):
+        return tcp_address(spec[4:])
+    # guess as to the type of socket:
+    if ':' in spec and '/' not in spec:
+        return tcp_address(spec)
+    return ipc_address(spec)
 
 
 parser = ArgumentParser()
@@ -321,7 +332,13 @@ def bind():
     return server
 
 
-selector.register(sys.stdin.buffer, EVENT_READ, on_stdin)
+try:
+    selector.register(sys.stdin.buffer, EVENT_READ, on_stdin)
+except PermissionError as e:
+    if e.errno != 1:
+        raise
+    debug('no stdin available')
+
 server = bind() if args.bind else None
 
 try:
