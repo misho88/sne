@@ -63,9 +63,18 @@ parser.add_argument(
     'address', type=address,
     help='address to listen on',
 )
-parser.add_argument(
+action = parser.add_mutually_exclusive_group(required=True)
+action.add_argument(
     '--action', '-a',
     help='what to do with the connection (an argv)',
+)
+action.add_argument(
+    '--pub', '-P', action='store_true',
+    help='alias for --action sne-pub',
+)
+action.add_argument(
+    '--sub', '-S', action='store_true',
+    help='alias for --action sne-sub',
 )
 parser.add_argument(
     '--io-mapping', '-m', nargs=5,
@@ -98,6 +107,10 @@ parser.add_argument(
     help='how to provide feedback on remote connections'
 )
 args = parser.parse_args()
+if args.pub:
+    args.action = 'sne-pub'
+if args.sub:
+    args.action = 'sne-sub'
 
 if args.connect and args.min_remotes > 1:
     print(
