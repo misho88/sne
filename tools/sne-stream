@@ -193,8 +193,11 @@ def on_stdin(stdin):
     piece = stdin.read1(args.buffer_size)
     if piece:
         for hin in handler_stdins:
-            hin.write(piece)
-            hin.flush()
+            try:
+                hin.write(piece)
+                hin.flush()
+            except BrokenPipeError:
+                pass
     else:
         selector.unregister(stdin)
         stdin.close()
@@ -257,7 +260,10 @@ def create_handler_process(remote):
 def destroy_handler_process(proc, inputs, remote):
     proc.waitpid()
     for input in inputs.values():
-        input.close()
+        try:
+            input.close()
+        except BrokenPipeError:
+            pass
     remote.close()
     try:
         selector.unregister(remote)
@@ -273,43 +279,63 @@ def destroy_handler_process(proc, inputs, remote):
 @to
 def on_remote(remin, remote):
     debug("enter")
-    piece = remote.recv(args.buffer_size)
-    debug(piece)
-    if piece:
-        remin.write(piece)
-        remin.flush()
-    else:
-        selector.unregister(remote)
-        remote.shutdown(SHUT_RD)
-        remin.close()
+    try:
+        piece = remote.recv(args.buffer_size)
+        debug(piece)
+        if piece:
+            remin.write(piece)
+            remin.flush()
+        else:
+            selector.unregister(remote)
+            remote.shutdown(SHUT_RD)
+            remin.close()
+    except (ConnectionResetError, BrokenPipeError) as e:
+        debug(sys.stdout.closed)
+        if sys.stdout.closed:
+            raise Finished
+        debug(e)
     debug("exit")
+
+
+def to_stdxxx(piece, stream):
+    try:
+        stream.write(piece)
+        stream.flush()
+    except BrokenPipeError as e:
+        try:
+            stream.close()
+        except BrokenPipeError:  # this will definitely happen
+            pass                 # but close() succeeds enough
+        raise Finished from e
 
 
 @to
 def on_handler_output(proc, inputs, outputs, remote, output):
     debug(f"enter {output}")
     piece = output.read1()
-    if piece:
+    try:
+        if not piece:
+            raise EOFError
         if outputs.get('stdout') is output:
             debug(f'{piece} to stdout')
-            sys.stdout.buffer.write(piece)
-            sys.stdout.buffer.flush()
+            to_stdxxx(piece, sys.stdout.buffer)
         elif outputs.get('stderr') is output:
             debug(f'{piece} to stderr')
-            sys.stderr.buffer.write(piece)
-            sys.stderr.buffer.flush()
+            to_stdxxx(piece, sys.stderr.buffer)
         elif outputs.get('remout') is output:
             debug(f'{piece} to remote')
             remote.send(piece)
         else:
             raise RuntimeError(f'output {output} not in {outputs}')
-    else:
+    except (EOFError, ConnectionResetError, BrokenPipeError, Finished) as e:
         output.close()
         selector.unregister(output)
         if outputs.get('remout') is output:
             remote.shutdown(SHUT_WR)
         if all(o.closed for o in outputs.values()):
             destroy_handler_process(proc, inputs, remote)
+        if isinstance(e, Finished):
+            raise
     debug("exit")
 
 
@@ -322,7 +348,7 @@ def connect():
                 remote.connect(bytes(address))
             else:
                 remote = create_connection(address)
-        except ConnectionRefusedError:
+        except (FileNotFoundError, ConnectionRefusedError):
             sleep(0.5)
         else:
             create_handler_process(remote)

@@ -22,10 +22,13 @@ class Finished(Exception):
 stdout = open(1, 'wb')
 remin = open(3, 'rb')
 
-with remin, stdout:
-    try:
-        while (piece := remin.read1(args.buffer_size)):
-            stdout.write(piece)
-            stdout.flush()
-    except (KeyboardInterrupt, Finished):
-        pass
+try:
+    with remin, stdout:
+        try:
+            while (piece := remin.read1(args.buffer_size)):
+                stdout.write(piece)
+                stdout.flush()
+        except (KeyboardInterrupt, Finished):
+            pass
+except BrokenPipeError:
+    pass
