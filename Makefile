@@ -4,7 +4,12 @@ BIN=/usr/local/bin
 
 EXE=$(wildcard tools/*)
 
+pull:
+	cd pysh && make pull
+	git pull
+
 install:
+	cd pysh && make install
 	install -d $(DESTDIR)$(BIN)
 	install $(EXE) $(DESTDIR)$(BIN)
 
