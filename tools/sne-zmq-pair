@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+
+from argparse import ArgumentParser
+import zmq
+import sys
+
+stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
+
+parser = ArgumentParser()
+mode = parser.add_mutually_exclusive_group(required=True)
+mode.add_argument(
+    '--bind', '-b', action='store_true',
+    help='bind to an address and listen for connections',
+)
+mode.add_argument(
+    '--connect', '-c', action='store_true',
+    help='connect to something that is listening for connections',
+)
+parser.add_argument(
+    'address',
+    help='ZMQ-formatted address',
+)
+args = parser.parse_args()
+
+
+class Done(Exception):
+    pass
+
+
+def write_and_flush(data):
+    stdout.write(data)
+    stdout.flush()
+
+
+with \
+    zmq.Context() as ctx, \
+    ctx.socket(zmq.PAIR) as sock:  # noqa: E125
+
+    (sock.bind if args.bind else sock.connect)(args.address)
+    pipes = {}
+    pipes[stdin.fileno()] = stdin.read1, sock.send
+    pipes[sock] = sock.recv, write_and_flush
+
+    poller = zmq.Poller()
+    for fd in pipes:
+        poller.register(fd, zmq.POLLIN)
+
+    try:
+        while True:
+            for fd, mask in poller.poll():
+                read, write = pipes[fd]
+                if (data := read()):
+                    write(data)
+                    print(repr(data))
+                else:
+                    raise Done
+    except (KeyboardInterrupt, Done):
+        pass
