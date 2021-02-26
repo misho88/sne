@@ -4,7 +4,7 @@ BIN=/usr/local/bin
 
 EXE=$(wildcard tools/*)
 
-GIT_BRANCH=main
+GIT_BRANCH ?= "main"
 
 checkout:
 	cd pysh && make checkout
