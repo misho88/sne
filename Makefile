@@ -4,6 +4,11 @@ BIN=/usr/local/bin
 
 EXE=$(wildcard tools/*)
 
+GIT_BRANCH=main
+
+checkout:
+	cd pysh && make checkout
+	git checkout $(GIT_BRANCH)
 pull:
 	cd pysh && make pull
 	git pull
